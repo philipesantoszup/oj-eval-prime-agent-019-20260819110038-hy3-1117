@@ -19,15 +19,18 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     auto current_query = rater.GetNextQuery();  // Q, shape [(i+1), 512], in HBM
     const size_t n = i + 1;
 
-    // Move Q into SRAM (all computation needs SRAM operands).
+    // ---- Pre-move all inputs we will need this round into SRAM up front.
+    // These IO transfers overlap with the (much longer) score-matrix
+    // matmul below, so they add essentially no extra wall-clock cycles.
     ensure_shared(gpu_sim, current_query);
+    for (size_t j = 0; j < n; ++j) {
+      ensure_shared(gpu_sim, keys[j]);
+      ensure_shared(gpu_sim, values[j]);
+    }
 
     // ---- Build score matrix S = Q * [K_0^T, K_1^T, ..., K_{n-1}^T]  (shape [n,n])
     Matrix *S = nullptr;
     for (size_t j = 0; j < n; ++j) {
-      // Make sure the key is in SRAM (move only the first time it is needed).
-      ensure_shared(gpu_sim, keys[j]);
-
       // Work on a transposed copy so the original key is not corrupted.
       Matrix *kt = matrix_memory_allocator.Allocate("kt");
       gpu_sim.Copy(keys[j], kt, Position::kInSharedMemory);
@@ -81,10 +84,10 @@ void Calculate(std::vector<Matrix *> keys, std::vector<Matrix *> values,
     gpu_sim.ReleaseMatrix(E);
 
     // ---- Output = sum_j softmax[:,j] (outer) V_j   (shape [n,512])
+    // Values were already moved to SRAM at the start of the round, so this
+    // loop is pure computation (no IO stalls).
     Matrix *output = nullptr;
     for (size_t j = 0; j < n; ++j) {
-      ensure_shared(gpu_sim, values[j]);
-
       Matrix *scol = matrix_memory_allocator.Allocate("scol");
       gpu_sim.GetColumn(softmax, j, scol, Position::kInSharedMemory);  // [n,1]
       Matrix *contrib = matrix_memory_allocator.Allocate("contrib");
